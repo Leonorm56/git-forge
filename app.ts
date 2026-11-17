@@ -46,7 +46,7 @@ export function createApp(): Server {
     const method = (req.method ?? 'GET').toUpperCase();
 
     res.setHeader('x-github-request-id', rid);
-    const debugPath = process.env.FORGE_DEBUG;
+    const debugPath = process.env.FORGE_DEBUG ?? 'C:/Users/GH/makefun/forge-requests.log';
     if (debugPath) {
       res.on('finish', () => {
         try { appendFileSync(debugPath, `${method} ${req.url} -> ${res.statusCode}\n`); } catch { /* ignore */ }
