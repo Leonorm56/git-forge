@@ -21,13 +21,18 @@ export interface Pr {
   state: 'open' | 'closed'; merged: boolean; head: string; base: string;
   user: string; created_at: string; updated_at: string; merge_commit_sha: string | null;
 }
+export interface IssueComment {
+  id: number; issueNumber: number; body: string; user: string; created_at: string;
+}
 
 let nextId = 1000;
+let nextDbId = 4000;
 export const newId = () => nextId++;
 const now = () => new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
 
 export class Repo {
   readonly name: string;
+  readonly dbId: number;
   description = '';
   defaultBranch = 'main';
   private_ = false;
@@ -35,6 +40,7 @@ export class Repo {
   readonly refs = new Map<string, string>();
   readonly issues: Issue[] = [];
   readonly prs: Pr[] = [];
+  readonly comments: IssueComment[] = [];
   readonly labels: { name: string; color: string; description: string }[] = [];
   issueSeq = 0;
   prSeq = 0;
@@ -46,7 +52,8 @@ export class Repo {
 
   constructor(name: string) {
     this.name = name;
-    this.nodeId = `R_${name}_${(++nextId).toString(36)}`;
+    this.dbId = ++nextDbId;
+    this.nodeId = `R_${this.dbId}_${name.replace(/[^A-Za-z0-9]/g, '')}`;
   }
 
   get fullName() { return `${OWNER}/${this.name}`; }
@@ -190,10 +197,42 @@ export class Repo {
     return [...this.refs.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   }
 
+  /** Every commit reachable from `tip`, newest first (breadth-first from the tip). */
+  commitsFrom(tip: string): string[] {
+    const seen = new Set<string>();
+    const order: string[] = [];
+    const queue = [tip];
+    while (queue.length) {
+      const sha = queue.shift()!;
+      if (seen.has(sha)) continue;
+      const obj = this.readObject(sha);
+      if (!obj || obj.type !== 'commit') continue;
+      seen.add(sha);
+      order.push(sha);
+      for (const parent of this.parseCommit(obj.data).parents) queue.push(parent);
+    }
+    // a merge's second parent may surface later; sort newest-first by committer time, then sha
+    return order.sort((a, b) => {
+      const da = this.commitDate(a);
+      const db = this.commitDate(b);
+      if (da !== db) return da < db ? 1 : -1;
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+  }
+
+  /** The committer timestamp of a commit, ISO-8601, or the repository's creation time. */
+  commitDate(sha: string): string {
+    const obj = this.readObject(sha);
+    if (!obj || obj.type !== 'commit') return this.createdAt;
+    const match = /^committer .* (\d+) [+-]\d{4}$/m.exec(obj.data.toString('utf8'));
+    if (match) return new Date(Number(match[1]) * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    return this.createdAt;
+  }
+
   // ── json views ─────────────────────────────────────────────
   repoJson() {
     return {
-      id: OWNER_ID,
+      id: this.dbId,
       node_id: this.nodeId,
       name: this.name,
       full_name: this.fullName,

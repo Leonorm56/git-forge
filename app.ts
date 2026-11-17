@@ -1,7 +1,6 @@
 // app.ts — the server: routes to git smart HTTP, REST v3, GraphQL v4 and MCP.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { appendFileSync } from 'node:fs';
 import { handleInfoRefs, handleUploadPack, handleReceivePack } from './smart.ts';
 import { handleRest, HttpError, readBody } from './rest.ts';
 import { handleGraphql } from './graphql.ts';
@@ -46,12 +45,6 @@ export function createApp(): Server {
     const method = (req.method ?? 'GET').toUpperCase();
 
     res.setHeader('x-github-request-id', rid);
-    const debugPath = process.env.FORGE_DEBUG ?? 'C:/Users/GH/makefun/forge-requests.log';
-    if (debugPath) {
-      res.on('finish', () => {
-        try { appendFileSync(debugPath, `${method} ${req.url} -> ${res.statusCode}\n`); } catch { /* ignore */ }
-      });
-    }
 
     if (method === 'GET' && path === '/healthz') { sendJson(res, 200, { ok: true }); return; }
 
@@ -95,25 +88,29 @@ export function createApp(): Server {
       if (path === '/api/graphql' && method === 'POST') {
         let parsed: any;
         try { parsed = JSON.parse(body.toString('utf8')); } catch { sendJson(res, 400, { message: 'Problems parsing JSON' }); return; }
-        const query = typeof parsed?.query === 'string' ? parsed.query : '';
-        const variables = parsed?.variables ?? undefined;
-        const operationName = typeof parsed?.operationName === 'string' ? parsed.operationName : undefined;
-        if (!query) { sendJson(res, 400, { message: 'query is required' }); return; }
-        const result = handleGraphql(query, variables, operationName);
-        if (Array.isArray(result)) {
-          // two operation documents in one body: two results, in order
-          sendJson(res, 200, result);
+        const answerOne = (entry: any): Record<string, unknown> => {
+          const query = typeof entry?.query === 'string' ? entry.query : '';
+          if (!query) return { data: null, errors: [{ message: 'query is required' }] };
+          const variables = entry?.variables ?? undefined;
+          const operationName = typeof entry?.operationName === 'string' ? entry.operationName : undefined;
+          const result = handleGraphql(query, variables, operationName);
+          if ('data' in result || 'errors' in result) {
+            const payload: Record<string, unknown> = {};
+            if ('data' in result) payload.data = result.data;
+            if ('errors' in result) payload.errors = result.errors;
+            return payload;
+          }
+          return { data: result };
+        };
+        if (Array.isArray(parsed)) {
+          // GitHub's operation batching: one request, one response per operation, in order.
+          if (parsed.length === 0) { sendJson(res, 400, { message: 'empty batch' }); return; }
+          sendJson(res, 200, parsed.map(answerOne));
           return;
         }
-        if ('data' in result || 'errors' in result) {
-          const payload: Record<string, unknown> = {};
-          if ('data' in result) payload.data = result.data;
-          if ('errors' in result) payload.errors = result.errors;
-          sendJson(res, 200, payload);
-          return;
-        }
-        // introspection result
-        sendJson(res, 200, { data: result });
+        if (parsed === null || typeof parsed !== 'object') { sendJson(res, 400, { message: 'Problems parsing JSON' }); return; }
+        if (typeof parsed.query !== 'string' || parsed.query === '') { sendJson(res, 400, { message: 'query is required' }); return; }
+        sendJson(res, 200, answerOne(parsed));
         return;
       }
 

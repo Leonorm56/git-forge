@@ -5,117 +5,108 @@ import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 import type { Repo } from './store.ts';
 
-export const pkt = (s: string | Buffer) => {
+export const ZERO = '0'.repeat(40);
+
+export const pkt = (s: string | Buffer): Buffer => {
   const body = Buffer.isBuffer(s) ? s : Buffer.from(s, 'utf8');
   const len = (body.length + 4).toString(16).padStart(4, '0');
   return Buffer.concat([Buffer.from(len, 'ascii'), body]);
 };
-export const flush = () => Buffer.from('0000', 'ascii');
+export const flush = (): Buffer => Buffer.from('0000', 'ascii');
+export const delim = (): Buffer => Buffer.from('0001', 'ascii');
 
 // ── pack parsing ──────────────────────────────────────────────
 interface PackEntry { type: 'commit' | 'tree' | 'blob' | 'tag'; data: Buffer }
 
-/** The number of bytes of zlib-compressed data starting at `offset`. */
-function zlibStreamLength(pack: Buffer, offset: number, _sizeHint: number): number {
-  const chunk = pack.subarray(offset);
-  const works = (n: number) => {
-    try { inflateSync(chunk.subarray(0, n)); return true; }
-    catch { return false; }
+/** Inflate one zlib stream and report how many input bytes it consumed. */
+function inflateAt(pack: Buffer, offset: number): { data: Buffer; used: number } {
+  const info = inflateSync(pack.subarray(offset), { info: true }) as unknown as {
+    buffer: Buffer;
+    engine: { bytesWritten: number };
   };
-  let lo = 8, hi = Math.min(chunk.length, 64);
-  while (!works(hi)) {
-    if (hi >= chunk.length) break;
-    const next = Math.min(chunk.length, hi * 2 + 32);
-    lo = hi;           // hi was infeasible, so the answer is past it
-    hi = next;
-  }
-  if (works(lo)) return lo; // inflated in the first window already
-  let a = lo, b = hi;
-  while (a < b) {
-    const mid = (a + b) >> 1;
-    if (works(mid)) b = mid; else a = mid + 1;
-  }
-  return a;
+  const used = info.engine?.bytesWritten;
+  if (!Number.isFinite(used) || used <= 0) throw new Error('could not measure a zlib stream');
+  return { data: info.buffer, used };
 }
 
 export function parsePack(repo: Repo, pack: Buffer): PackEntry[] {
-  if (pack.length < 12 || pack.subarray(0, 4).toString('ascii') !== 'PACK') {
-    throw new Error('not a packfile');
-  }
+  if (pack.length < 12 || pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('not a packfile');
   const version = pack.readUInt32BE(4);
   const count = pack.readUInt32BE(8);
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
   let offset = 12;
-  const raw: { type: number; size: number; data: Buffer; offset: number; baseSha?: string; deltaBaseAt?: number }[] = [];
-  for (let i = 0; i < count; i++) {
+  const raw: { type: number; data: Buffer; offset: number; deltaBaseAt?: number; baseSha?: string }[] = [];
+  for (let i = 0; i < count; i += 1) {
     const start = offset;
     let b = pack[offset];
     const type = (b >> 4) & 7;
     let size = b & 0x0f;
     let shift = 4;
-    offset++;
+    offset += 1;
     while (b & 0x80) {
       b = pack[offset++];
       size |= (b & 0x7f) << shift;
       shift += 7;
     }
     if (type === 6) {
-      let rel = 0, c = pack[offset++];
-      rel = c & 0x7f;
-      while (c & 0x80) { c = pack[offset++]; rel = ((rel + 1) << 7) | (c & 0x7f); }
-      const streamLen = zlibStreamLength(pack, offset, size);
-      const data = inflateSync(pack.subarray(offset, offset + streamLen));
-      raw.push({ type: 6, size, data, offset: start, deltaBaseAt: start - rel });
-      offset += streamLen;
+      let c = pack[offset++];
+      let rel = c & 0x7f;
+      while (c & 0x80) {
+        c = pack[offset++];
+        rel = ((rel + 1) << 7) | (c & 0x7f);
+      }
+      const { data, used } = inflateAt(pack, offset);
+      raw.push({ type: 6, data, offset: start, deltaBaseAt: start - rel });
+      offset += used;
       continue;
     }
     if (type === 7) {
       const baseSha = pack.subarray(offset, offset + 20).toString('hex');
       offset += 20;
-      const streamLen = zlibStreamLength(pack, offset, size);
-      const data = inflateSync(pack.subarray(offset, offset + streamLen));
-      raw.push({ type: 7, size, data, offset: start, baseSha });
-      offset += streamLen;
+      const { data, used } = inflateAt(pack, offset);
+      raw.push({ type: 7, data, offset: start, baseSha });
+      offset += used;
       continue;
     }
-    const streamLen = zlibStreamLength(pack, offset, size);
-    raw.push({ type, size, data: inflateSync(pack.subarray(offset, offset + streamLen)), offset: start });
-    offset += streamLen;
+    const { data, used } = inflateAt(pack, offset);
+    raw.push({ type, data, offset: start });
+    offset += used;
   }
-  const resolved = new Map<string, Buffer>();
+
+  const typeName = (t: number): PackEntry['type'] =>
+    t === 1 ? 'commit' : t === 2 ? 'tree' : t === 3 ? 'blob' : t === 4 ? 'tag' : 'blob';
   const shaOf = (type: string, data: Buffer) =>
     createHash('sha1').update(`${type} ${data.length}\0`).update(data).digest('hex');
+
+  const resolved = new Map<string, { type: PackEntry['type']; data: Buffer }>();
+  const byOffset = new Map<number, { type: PackEntry['type']; data: Buffer }>();
   const entries: PackEntry[] = [];
-  for (let i = 0; i < raw.length; i++) {
-    const r = raw[i];
+  for (const r of raw) {
     let payload: Buffer;
-    let typeName: PackEntry['type'];
+    let kind: PackEntry['type'];
     if (r.type === 6) {
-      const base = raw.find((q) => q.offset === r.deltaBaseAt);
-      const baseBuf = base ? resolved.get(shaOf(typeNameOf(base.type), base.data)) : null;
-      if (!baseBuf) throw new Error('ofs_delta base missing');
-      payload = applyDelta(baseBuf, r.data);
-      typeName = typeNameOf(base.type) as PackEntry['type'];
+      const base = r.deltaBaseAt !== undefined ? byOffset.get(r.deltaBaseAt) : undefined;
+      if (!base) throw new Error('ofs_delta base missing');
+      payload = applyDelta(base.data, r.data);
+      kind = base.type;
     } else if (r.type === 7) {
-      const baseBuf =
-        resolved.get(r.baseSha!) ??
-        repo.readObject(r.baseSha!)?.data ??
-        null;
-      if (!baseBuf) throw new Error('ref_delta base missing');
-      payload = applyDelta(baseBuf, r.data);
-      typeName = 'blob';
+      const known = r.baseSha !== undefined ? resolved.get(r.baseSha) : undefined;
+      const stored = r.baseSha !== undefined ? repo.readObject(r.baseSha) : null;
+      const base = known ?? (stored ? { type: stored.type as PackEntry['type'], data: stored.data } : null);
+      if (!base) throw new Error('ref_delta base missing');
+      payload = applyDelta(base.data, r.data);
+      kind = base.type;
     } else {
       payload = r.data;
-      typeName = typeNameOf(r.type);
+      kind = typeName(r.type);
     }
-    const sha = shaOf(typeName, payload);
-    resolved.set(sha, payload);
-    entries.push({ type: typeName, data: payload });
+    const object = { type: kind, data: payload };
+    resolved.set(shaOf(kind, payload), object);
+    byOffset.set(r.offset, object);
+    entries.push({ type: kind, data: payload });
   }
   return entries;
 }
-const typeNameOf = (t: number): PackEntry['type'] =>
-  t === 1 ? 'commit' : t === 2 ? 'tree' : t === 3 ? 'blob' : 'tag';
 
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
   let i = 0;
@@ -161,11 +152,10 @@ export function buildPack(entries: { type: string; data: Buffer }[]): Buffer {
   const parts: Buffer[] = [header];
   for (const e of entries) {
     parts.push(encodeTypeAndSize(typeNum(e.type), e.data.length));
-    parts.push(deflateSync(e.data));
+    parts.push(deflateSync(e.data, { level: 1 }));
   }
   const pack = Buffer.concat(parts);
-  const trailer = createHash('sha1').update(pack).digest();
-  return Buffer.concat([pack, trailer]);
+  return Buffer.concat([pack, createHash('sha1').update(pack).digest()]);
 }
 const typeNum = (t: string) => (t === 'commit' ? 1 : t === 'tree' ? 2 : t === 'blob' ? 3 : 4);
 function encodeTypeAndSize(type: number, size: number): Buffer {
@@ -178,39 +168,131 @@ function encodeTypeAndSize(type: number, size: number): Buffer {
 }
 
 // ── reachable object walk ─────────────────────────────────────
-export function reachable(repo: Repo, tips: string[], depth?: number): { type: string; data: Buffer }[] {
-  const out = new Map<string, { type: string; data: Buffer }>();
-  const visitCommit = (sha: string, level: number) => {
-    if (out.has(sha)) return;
-    const obj = repo.readObject(sha);
-    if (!obj || obj.type !== 'commit') return;
-    out.set(sha, { type: 'commit', data: obj.data });
-    const commit = repo.parseCommit(obj.data);
-    for (const e of repo.readTree(commit.tree)) visitTree(e);
-    if (depth === undefined || level + 1 < depth) {
-      for (const p of commit.parents) visitCommit(p, level + 1);
-    }
-  };
-  const visitTree = (entry: { mode: string; name: string; sha: string }) => {
-    const obj = repo.readObject(entry.sha);
-    if (!obj || out.has(entry.sha)) return;
-    out.set(entry.sha, { type: obj.type, data: obj.data });
-    if (obj.type === 'tree') for (const e of repo.readTree(entry.sha)) visitTree(e);
-  };
-  for (const t of tips) visitCommit(t, 0);
-  return [...out.values()];
+export interface WalkResult {
+  entries: { type: string; data: Buffer }[];
+  shallow: string[];
+  unshallow: string[];
 }
 
-/** Wrap raw payload chunks in side-band-64k band 1 frames. */
+/**
+ * Every object reachable from `tips`, minus everything reachable from `haves`.
+ * `depth` limits commit generations; `shallowBoundaries` are commits whose parents the client
+ * does not have (they end the walk). The returned shallow/unshallow lines move the boundary.
+ */
+export function walk(
+  repo: Repo,
+  tips: string[],
+  options: { haves?: string[]; depth?: number; shallowBoundaries?: string[] } = {},
+): WalkResult {
+  const boundaries = new Set(options.shallowBoundaries ?? []);
+  const depth = options.depth;
+
+  // A shallow boundary names a commit the client holds but whose parents it does not: the closure
+  // walk must stop there, and the commit itself must never be re-sent.
+  const haveSet = new Set<string>();
+  const visitHave = (sha: string) => {
+    if (haveSet.has(sha)) return;
+    const obj = repo.readObject(sha);
+    if (!obj) return;
+    haveSet.add(sha);
+    if (obj.type === 'commit') {
+      if (boundaries.has(sha)) return;
+      const commit = repo.parseCommit(obj.data);
+      visitHave(commit.tree);
+      for (const p of commit.parents) visitHave(p);
+    } else if (obj.type === 'tree') {
+      for (const e of repo.readTree(sha)) visitHave(e.sha);
+    } else if (obj.type === 'tag') {
+      const target = parseTagTarget(obj.data);
+      if (target) visitHave(target);
+    }
+  };
+  for (const h of options.haves ?? []) visitHave(h);
+
+  const included = new Map<string, { type: string; data: Buffer }>();
+  const shallow: string[] = [];
+  const unshallow: string[] = [];
+  const visitedCommits = new Set<string>();
+  const held = (sha: string) => haveSet.has(sha) || boundaries.has(sha);
+
+  const addObject = (sha: string) => {
+    if (included.has(sha) || held(sha)) return;
+    const obj = repo.readObject(sha);
+    if (!obj) return;
+    included.set(sha, { type: obj.type, data: obj.data });
+  };
+  const addClosure = (sha: string) => {
+    if (included.has(sha) || held(sha)) return;
+    const obj = repo.readObject(sha);
+    if (!obj) return;
+    included.set(sha, { type: obj.type, data: obj.data });
+    if (obj.type === 'tree') for (const entry of repo.readTree(sha)) addClosure(entry.sha);
+    else if (obj.type === 'tag') {
+      const target = parseTagTarget(obj.data);
+      if (target) addClosure(target);
+    }
+  };
+  const visitWant = (sha: string) => {
+    const obj = repo.readObject(sha);
+    if (!obj) return;
+    if (obj.type === 'tag') {
+      addObject(sha);
+      const target = parseTagTarget(obj.data);
+      if (target) visitWant(target);
+      return;
+    }
+    if (obj.type === 'commit') {
+      visitCommit(sha, 0);
+      return;
+    }
+    addClosure(sha);
+  };
+  const visitCommit = (sha: string, level: number) => {
+    if (visitedCommits.has(sha)) return;
+    const obj = repo.readObject(sha);
+    if (!obj || obj.type !== 'commit') return;
+    visitedCommits.add(sha);
+    const commit = repo.parseCommit(obj.data);
+    const boundary = boundaries.has(sha);
+    // a non-boundary have is held in full: the client has its tree and every ancestor
+    if (haveSet.has(sha) && !boundary) return;
+    const atLimit = depth !== undefined && level + 1 >= depth;
+    if (!boundary) {
+      addObject(sha);
+      addClosure(commit.tree);
+    }
+    const parents = commit.parents;
+    if (atLimit) {
+      if (parents.length > 0) shallow.push(sha);
+      return;
+    }
+    // this boundary commit now gets its parents: it is no longer shallow
+    if (boundary) unshallow.push(sha);
+    for (const p of parents) visitCommit(p, level + 1);
+  };
+  for (const tip of tips) visitWant(tip);
+  return {
+    entries: [...included.values()],
+    shallow: [...new Set(shallow)],
+    unshallow: [...new Set(unshallow)],
+  };
+}
+
+function parseTagTarget(data: Buffer): string | null {
+  const match = /^object ([0-9a-f]{40})$/m.exec(data.toString('utf8'));
+  return match ? match[1] : null;
+}
+
+/** Wrap raw payload chunks in side-band-64k band 1 frames, one flush at the end. */
 export function sideband(chunks: Buffer[]): Buffer {
   const out: Buffer[] = [];
+  const MAX = 65515;
   for (const chunk of chunks) {
-    if (chunk.length === 0) continue;
-    const MAX = 65516;
     for (let i = 0; i < chunk.length; i += MAX) {
       const piece = chunk.subarray(i, Math.min(i + MAX, chunk.length));
       out.push(pkt(Buffer.concat([Buffer.from([1]), piece])));
     }
   }
-  return Buffer.concat([...out, flush()]);
+  out.push(flush());
+  return Buffer.concat(out);
 }

@@ -60,7 +60,12 @@ export function handleMcpMessage(msg: any): any | null {
     });
   }
   if (method === 'server/discover') {
-    return rpc(id, { supportedVersions: ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26'] });
+    return rpc(id, {
+      supportedVersions: ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26'],
+      capabilities: { tools: { listChanged: false } },
+      serverInfo: { name: 'github', version: '1.0.0' },
+      _meta: { 'io.modelcontextprotocol/serverInfo': { name: 'github', version: '1.0.0' } },
+    });
   }
   if (method === 'ping') return rpc(id, {});
   if (method === 'resources/list') return rpc(id, { resources: [] });
