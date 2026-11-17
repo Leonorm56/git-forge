@@ -2,8 +2,9 @@
 // Everything is in memory; nothing leaves the process except the responses themselves.
 
 import { createHash } from 'node:crypto';
+import { VIEWER_LOGIN } from './scenario.ts';
 
-export const OWNER = process.env.FORGE_OWNER ?? 'shop';
+export const OWNER = process.env.FORGE_OWNER ?? VIEWER_LOGIN;
 export const OWNER_ID = 101;
 
 const sha1hex = (type: string, data: Buffer): string =>
