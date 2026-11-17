@@ -30,6 +30,7 @@ export class Repo {
   readonly name: string;
   description = '';
   defaultBranch = 'main';
+  private_ = false;
   readonly objects = new Map<string, { type: string; data: Buffer }>();
   readonly refs = new Map<string, string>();
   readonly issues: Issue[] = [];
@@ -196,7 +197,7 @@ export class Repo {
       node_id: this.nodeId,
       name: this.name,
       full_name: this.fullName,
-      private: false,
+      private: this.private_,
       owner: { login: OWNER, id: OWNER_ID, node_id: `U_${OWNER}`, avatar_url: '', type: 'User' },
       html_url: `https://github.example/${this.fullName}`,
       description: this.description,
@@ -218,7 +219,7 @@ export class Repo {
       has_pages: false,
       archived: false,
       disabled: false,
-      visibility: 'public',
+      visibility: this.private_ ? 'private' : 'public',
       permissions: { admin: true, push: true, pull: true },
     };
   }

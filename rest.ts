@@ -85,6 +85,7 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, url:
     if (!body.name || typeof body.name !== 'string') throw new HttpError(422, 'name is required');
     const repo = ensureRepo(body.name);
     if (body.description !== undefined) repo.description = String(body.description ?? '');
+    if (body.private !== undefined) repo.private_ = Boolean(body.private);
     json(res, 201, repo.repoJson());
     return true;
   }

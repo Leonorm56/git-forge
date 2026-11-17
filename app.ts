@@ -1,6 +1,7 @@
 // app.ts — the server: routes to git smart HTTP, REST v3, GraphQL v4 and MCP.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { appendFileSync } from 'node:fs';
 import { handleInfoRefs, handleUploadPack, handleReceivePack } from './smart.ts';
 import { handleRest, HttpError, readBody } from './rest.ts';
 import { handleGraphql } from './graphql.ts';
@@ -45,6 +46,12 @@ export function createApp(): Server {
     const method = (req.method ?? 'GET').toUpperCase();
 
     res.setHeader('x-github-request-id', rid);
+    const debugPath = process.env.FORGE_DEBUG;
+    if (debugPath) {
+      res.on('finish', () => {
+        try { appendFileSync(debugPath, `${method} ${req.url} -> ${res.statusCode}\n`); } catch { /* ignore */ }
+      });
+    }
 
     if (method === 'GET' && path === '/healthz') { sendJson(res, 200, { ok: true }); return; }
 
